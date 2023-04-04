@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/voxelmorph.iml" filepath="$PROJECT_DIR$/.idea/voxelmorph.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/vxm_attn_2_two_maps.iml" filepath="$PROJECT_DIR$/.idea/vxm_attn_2_two_maps.iml" />
     </modules>
   </component>
 </project>

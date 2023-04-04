@@ -2,19 +2,455 @@ import os
 import sys
 import glob
 import numpy as np
+import math
+import matplotlib.pyplot as plt
 
 from . import py
 
 
+def intra_scan_pair(vol_names, augment, mode="test", bidir=False, batch_size=1, prob_same=0, no_warp=False, **kwargs):
+    """
+    Generator for scan-to-scan registration.
+
+    Parameters:
+        vol_names: List of volume files to load, or list of preloaded volumes.
+        bidir: Yield input image as output for bidirectional models. Default is False.
+        batch_size: Batch size. Default is 1.
+        prob_same: Induced probability that source and target inputs are the same. Default is 0.
+        no_warp: Excludes null warp in output list if set to True (for affine training).
+            Default is False.
+        kwargs: Forwarded to the internal volgen generator.
+    """
+    zeros = None
+    segs = kwargs.get('segs')
+    ret_affine = kwargs.get('ret_affine')
+    gen = vol_pair_gen(vol_names, augment, mode=mode, batch_size=batch_size, **kwargs)
+    while True:
+        if segs:
+            if ret_affine:
+                bl, fu, seg, affine, orig_shape, crop_pos, bl_names, date_diff_true, date_diff_label = next(gen)
+            else:
+                bl, fu, seg, bl_names, date_diff_true, date_diff_label = next(gen)
+                
+            segvols = [seg, seg] if bidir else [seg]
+        else:
+            if ret_affine:
+                bl, fu, affine, orig_shape, crop_pos, bl_names, date_diff_true, date_diff_label = next(gen)
+            else:
+                bl, fu, bl_names, date_diff_true, date_diff_label = next(gen)
+
+        # some induced chance of making source and target equal
+        if prob_same > 0 and np.random.rand() < prob_same:
+            if np.random.rand() > 0.5:
+                bl = fu
+            else:
+                fu = bl
+
+        # cache zeros
+        if not no_warp:
+            shape = bl.shape[1:-1]
+            zeros = np.zeros((bl.shape[0], *shape, len(shape)))
+
+        invols = [bl, fu]
+        outvols = [fu, bl] if bidir else [fu]
+
+        if not no_warp:
+            outvols.append(zeros)
+
+        # invols: [moving, fixed], outvols = [fixed]
+        if segs:
+            if ret_affine:
+                yield (invols, outvols, segvols, affine, orig_shape, crop_pos, bl_names, date_diff_true, date_diff_label)
+            else:
+                yield (invols, outvols, segvols, bl_names, date_diff_true, date_diff_label)
+        else:
+            if ret_affine:
+                yield (invols, outvols, affine, orig_shape, crop_pos, bl_names, date_diff_true, date_diff_label)
+            else:
+                yield (invols, outvols, bl_names, date_diff_true, date_diff_label)
+
+
+def vol_pair_gen(
+        vol_names,
+        augment,
+        mode="test",
+        batch_size=1,
+        segs=None,
+        np_var='vol',
+        pad_shape=None,
+        resize_factor=1,
+        add_feat_axis=True,
+        ret_affine=False,
+        output_size=(96, 160, 128),
+):
+    """
+    Base generator for random intra-subject volume pair loading. Volumes can be passed as a path to
+    the parent directory, a glob pattern, a list of file paths, or a list of
+    preloaded volumes. Corresponding segmentations are additionally loaded if
+    `segs` is provided as a list (of file paths or preloaded segmentations) or set
+    to True. If `segs` is True, npz files with variable names 'vol' and 'seg' are
+    expected. Passing in preloaded volumes (with optional preloaded segmentations)
+    allows volumes preloaded in memory to be passed to a generator.
+
+    Parameters:
+        vol_names: Path, glob pattern, list of volume files to load, or list of
+            preloaded volumes.
+        batch_size: Batch size. Default is 1.
+        segs: Loads corresponding segmentations. Default is None.
+        np_var: Name of the volume variable if loading npz files. Default is 'vol'.
+        pad_shape: Zero-pads loaded volumes to a given shape. Default is None.
+        resize_factor: Volume resize factor. Default is 1.
+        add_feat_axis: Load volume arrays with added feature axis. Default is True.
+    """
+
+    # convert glob path to filenames
+    if isinstance(vol_names, str):
+        if os.path.isdir(vol_names):
+            vol_names = os.path.join(vol_names, '*')
+        vol_names = glob.glob(vol_names)
+
+    load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis,
+                       pad_shape=pad_shape, resize_factor=resize_factor, ret_affine=ret_affine,
+                       segs=segs, augment=augment, output_size=output_size)
+
+    # segs is now a flag of whether return segmentation images
+    # if isinstance(segs, list) and len(segs) != len(vol_names):
+    #     raise ValueError('Number of image files must match number of seg files.')
+    if mode == "train" or mode == "val":
+        while True:
+            # generate [batchsize] random image indices
+            indices = np.random.randint(len(vol_names), size=batch_size)
+            yield get_intra_batch(vol_names, load_params, indices, mode=mode)
+
+    elif mode =="test":
+        for idx in range(math.ceil(len(vol_names)/batch_size)):
+            if (idx + 1) * batch_size < len(vol_names):
+                indices = list(range(idx * batch_size, (idx + 1) * batch_size))
+            else:
+                indices = list(range(idx * batch_size, len(vol_names)))
+            # load volumes and concatenate
+            yield get_intra_batch(vol_names, load_params, indices, mode=mode)
+
+
+def get_intra_batch(vol_names, load_params, indices, mode="train"):
+
+    imgs_bl = []
+    imgs_fu = []
+    imgs_seg = []
+    date_diff_true = []
+    date_diff_label = []
+    affines = []
+    orig_shapes = []
+    crop_posns = []
+
+    for i in indices:
+        # since data augmentation is performed together with segmentation
+        # segmentation images should be loaded at the same time if seg is true
+        # imgs_bl, imgs_fu, imgs_seg, date_diff_true, affine matrix/crop site
+        if load_params["ret_affine"]:
+            temp1, temp2, temp3, temp4, affine, orig_shape, crop_pos = py.utils.load_bl_fu_file(vol_names[i], **load_params)
+            affines.append(affine)
+            orig_shapes.append(orig_shape)
+            crop_posns.append(crop_pos)
+        else:
+            temp1, temp2, temp3, temp4 = py.utils.load_bl_fu_file(vol_names[i], **load_params)
+
+        if np.random.rand() < 0.5:
+            imgs_bl.append(temp1)
+            imgs_fu.append(temp2)
+            imgs_seg.append(temp3)
+            date_diff_true.append(temp4)
+            date_diff_label.append(float(np.greater(temp4, 0)))
+        else:
+            imgs_bl.append(temp2)
+            imgs_fu.append(temp1)
+            imgs_seg.append(temp3)
+            date_diff_true.append(-temp4)
+            date_diff_label.append(float(np.greater(-temp4, 0)))
+
+    imgs_bl = np.concatenate(imgs_bl, axis=0)
+    imgs_fu = np.concatenate(imgs_fu, axis=0)
+    imgs_seg = np.concatenate(imgs_seg, axis=0)
+    affines = np.concatenate(np.expand_dims(affines, axis=0), axis=0)
+    orig_shapes = np.concatenate(np.expand_dims(orig_shapes, axis=0), axis=0)
+    crop_posns = np.concatenate(np.expand_dims(crop_posns, axis=0), axis=0)
+
+    img_names = [vol_names[i] for i in indices]
+
+    # return baseline affine image, not followup affine
+    if load_params["segs"]:
+        if load_params["ret_affine"]:
+            return [imgs_bl, imgs_fu, imgs_seg, affines, orig_shapes, crop_posns, img_names, date_diff_true, date_diff_label]
+        else:
+            return [imgs_bl, imgs_fu, imgs_seg, img_names, date_diff_true, date_diff_label]
+    else:
+        if load_params["ret_affine"]:
+            return [imgs_bl, imgs_fu, affines, orig_shapes, crop_posns, img_names, date_diff_true, date_diff_label]
+        else:
+            return [imgs_bl, imgs_fu, img_names, date_diff_true, date_diff_label]
+
+
+def intra_scan_pair_RISI(vol_names, augment, mode="test", bidir=False, batch_size=1, prob_same=0, no_warp=False, **kwargs):
+    """
+    Generator for scan-to-scan registration.
+
+    Parameters:
+        vol_names: List of volume files to load, or list of preloaded volumes.
+        bidir: Yield input image as output for bidirectional models. Default is False.
+        batch_size: Batch size. Default is 1.
+        prob_same: Induced probability that source and target inputs are the same. Default is 0.
+        no_warp: Excludes null warp in output list if set to True (for affine training).
+            Default is False.
+        kwargs: Forwarded to the internal volgen generator.
+    """
+    zeros = None
+    segs = kwargs.get('segs')
+    ret_affine = kwargs.get('ret_affine')
+    gen = vol_pair_gen_RISI(vol_names, augment, mode=mode, batch_size=batch_size, **kwargs)
+    while True:
+    # for idx in range(math.ceil(len(vol_names) / batch_size)):
+        sample = next(gen)
+
+        # some induced chance of making source and target equal
+        if prob_same > 0 and np.random.rand() < prob_same:
+            if np.random.rand() > 0.5:
+                bl = fu
+            else:
+                fu = bl
+
+        # cache zeros
+        if not no_warp:
+            shape = sample["imgs_bl1"].shape[1:]
+            zeros = np.zeros((sample["imgs_bl1"].shape[0], *shape, len(shape)))
+
+            [sample["imgs_fu1"]].append(zeros)
+            [sample["imgs_fu2"]].append(zeros)
+
+        yield sample
+
+
+def vol_pair_gen_RISI(
+        vol_names,
+        augment,
+        mode="test",
+        batch_size=1,
+        segs=None,
+        np_var='vol',
+        pad_shape=None,
+        resize_factor=1,
+        add_feat_axis=True,
+        ret_affine=False,
+        output_size=(96, 160, 128),
+        num_attn_maps=1,
+        risi_categories=4,
+):
+    """
+    Base generator for random intra-subject volume pair loading. Volumes can be passed as a path to
+    the parent directory, a glob pattern, a list of file paths, or a list of
+    preloaded volumes. Corresponding segmentations are additionally loaded if
+    `segs` is provided as a list (of file paths or preloaded segmentations) or set
+    to True. If `segs` is True, npz files with variable names 'vol' and 'seg' are
+    expected. Passing in preloaded volumes (with optional preloaded segmentations)
+    allows volumes preloaded in memory to be passed to a generator.
+
+    Parameters:
+        vol_names: Path, glob pattern, list of volume files to load, or list of
+            preloaded volumes.
+        batch_size: Batch size. Default is 1.
+        segs: Loads corresponding segmentations. Default is None.
+        np_var: Name of the volume variable if loading npz files. Default is 'vol'.
+        pad_shape: Zero-pads loaded volumes to a given shape. Default is None.
+        resize_factor: Volume resize factor. Default is 1.
+        add_feat_axis: Load volume arrays with added feature axis. Default is True.
+    """
+
+    # convert glob path to filenames
+    if isinstance(vol_names, str):
+        if os.path.isdir(vol_names):
+            vol_names = os.path.join(vol_names, '*')
+        vol_names = glob.glob(vol_names)
+
+    load_params = dict(np_var=np_var,
+                       add_batch_axis=True,
+                       add_feat_axis=add_feat_axis,
+                       pad_shape=pad_shape,
+                       resize_factor=resize_factor,
+                       ret_affine=ret_affine,
+                       segs=segs,
+                       augment=augment,
+                       output_size=output_size,
+                       num_attn_maps=num_attn_maps)
+
+    # segs is now a flag of whether return segmentation images
+    if mode == "train" or mode == "val":
+        while True:
+            # generate [batchsize] random image indices
+            indices = np.random.randint(len(vol_names), size=batch_size)
+            yield get_intra_batch_RISI(vol_names, load_params, indices, mode=mode, risi_categories=risi_categories)
+
+    elif mode =="test":
+        for idx in range(math.ceil(len(vol_names)/batch_size)):
+            if (idx + 1) * batch_size < len(vol_names):
+                indices = list(range(idx * batch_size, (idx + 1) * batch_size))
+            else:
+                indices = list(range(idx * batch_size, len(vol_names)))
+            # load volumes and concatenate
+            yield get_intra_batch_RISI(vol_names, load_params, indices, mode=mode, risi_categories=risi_categories)
+
+
+def get_intra_batch_RISI(vol_names, load_params, indices, mode="train", risi_categories=4):
+
+    sample = {}
+    sample["imgs_bl1"] = []
+    sample["imgs_fu1"] = []
+    sample["imgs_seg1"] = []
+    sample["date_diff_true1"] = []
+    sample["date_diff_label1"] = []
+    sample["affines1"] = []
+    sample["orig_shapes1"] = []
+    sample["crop_posns1"] = []
+
+    sample["imgs_bl2"] = []
+    sample["imgs_fu2"] = []
+    sample["imgs_seg2"] = []
+    sample["date_diff_true2"] = []
+    sample["date_diff_label2"] = []
+    sample["affines2"] = []
+    sample["orig_shapes2"] = []
+    sample["crop_posns2"] = []
+
+    for i in indices:
+        # since data augmentation is performed together with segmentation
+        # segmentation images should be loaded at the same time if seg is true
+        # imgs_bl, imgs_fu, imgs_seg, date_diff_true, affine matrix/crop site
+
+        single_sample1, single_sample2 = py.utils.load_bl_fu_file_RISI(vol_names[i], **load_params)
+
+        if load_params["ret_affine"]:
+            sample["affines1"].append(single_sample1["affine"])
+            sample["orig_shapes1"].append(single_sample1["orig_shapes"])
+            sample["crop_posns1"].append(single_sample1["crop_posns"])
+            sample["affines2"].append(single_sample2["affine"])
+            sample["orig_shapes2"].append(single_sample2["orig_shapes"])
+            sample["crop_posns2"].append(single_sample2["crop_posns"])
+
+        if np.random.rand() < 0.5:
+            sample["imgs_bl1"].append(single_sample1["vol_bl"])
+            sample["imgs_fu1"].append(single_sample1["vol_fu"])
+            sample["imgs_seg1"].append(single_sample1["vol_seg"])
+            sample["date_diff_true1"].append(single_sample1["date_diff_true"])
+            sample["date_diff_label1"].append(float(np.greater(single_sample1["date_diff_true"], 0)))
+        else:
+            sample["imgs_bl1"].append(single_sample1["vol_fu"])
+            sample["imgs_fu1"].append(single_sample1["vol_bl"])
+            sample["imgs_seg1"].append(single_sample1["vol_seg"])
+            sample["date_diff_true1"].append(-single_sample1["date_diff_true"])
+            sample["date_diff_label1"].append(float(np.greater(-single_sample1["date_diff_true"], 0)))
+
+        if np.random.rand() < 0.5:
+            sample["imgs_bl2"].append(single_sample2["vol_bl"])
+            sample["imgs_fu2"].append(single_sample2["vol_fu"])
+            sample["imgs_seg2"].append(single_sample2["vol_seg"])
+            sample["date_diff_true2"].append(single_sample2["date_diff_true"])
+            sample["date_diff_label2"].append(float(np.greater(single_sample2["date_diff_true"], 0)))
+        else:
+            sample["imgs_bl2"].append(single_sample2["vol_fu"])
+            sample["imgs_fu2"].append(single_sample2["vol_bl"])
+            sample["imgs_seg2"].append(single_sample2["vol_seg"])
+            sample["date_diff_true2"].append(-single_sample2["date_diff_true"])
+            sample["date_diff_label2"].append(float(np.greater(-single_sample2["date_diff_true"], 0)))
+
+    sample["imgs_bl1"] = np.concatenate(sample["imgs_bl1"], axis=0)
+    sample["imgs_bl2"] = np.concatenate(sample["imgs_bl2"], axis=0)
+    sample["imgs_fu1"] = np.concatenate(sample["imgs_fu1"], axis=0)
+    sample["imgs_fu2"] = np.concatenate(sample["imgs_fu2"], axis=0)
+
+    sample["imgs_seg1"] = np.concatenate(sample["imgs_seg1"], axis=0)
+    sample["imgs_seg2"] = np.concatenate(sample["imgs_seg2"], axis=0)
+
+    if load_params["ret_affine"]:
+        sample["affines1"] = np.concatenate(np.expand_dims(sample["affines1"], axis=0), axis=0)
+        sample["affines2"] = np.concatenate(np.expand_dims(sample["affines2"], axis=0), axis=0)
+        sample["orig_shapes1"] = np.concatenate(np.expand_dims(sample["orig_shapes1"], axis=0), axis=0)
+        sample["orig_shapes2"] = np.concatenate(np.expand_dims(sample["orig_shapes2"], axis=0), axis=0)
+
+        sample["crop_posns1"] = np.concatenate(np.expand_dims(sample["crop_posns1"], axis=0), axis=0)
+        sample["crop_posns2"] = np.concatenate(np.expand_dims(sample["crop_posns2"], axis=0), axis=0)
+
+    sample["img_names1"] = [vol_names[i].split(",")[0] for i in indices]
+    sample["img_names2"] = [vol_names[i].split(",")[1] for i in indices]
+
+    sample["date_diff_ratio"] = []
+    for x, y in zip(sample["date_diff_true1"], sample["date_diff_true2"]):
+        date_diff_ratio = abs(x / y)
+        if risi_categories == 4:
+            if date_diff_ratio < 0.5:
+                sample["date_diff_ratio"].append(0)
+            elif date_diff_ratio < 1:
+                sample["date_diff_ratio"].append(1)
+            elif date_diff_ratio < 2:
+                sample["date_diff_ratio"].append(2)
+            else:
+                sample["date_diff_ratio"].append(3)
+
+        elif risi_categories == 8:
+            if date_diff_ratio < 0.25:
+                sample["date_diff_ratio"].append(0)
+            elif date_diff_ratio < 0.5:
+                sample["date_diff_ratio"].append(1)
+            elif date_diff_ratio < 0.75:
+                sample["date_diff_ratio"].append(2)
+            elif date_diff_ratio < 1:
+                sample["date_diff_ratio"].append(3)
+            elif date_diff_ratio < 4/3:
+                sample["date_diff_ratio"].append(4)
+            elif date_diff_ratio < 2:
+                sample["date_diff_ratio"].append(5)
+            elif date_diff_ratio < 4:
+                sample["date_diff_ratio"].append(6)
+            else:
+                sample["date_diff_ratio"].append(7)
+    return sample
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def volgen(
-    vol_names,
-    augment,
-    batch_size=1,
-    segs=None,
-    np_var='vol',
-    pad_shape=None,
-    resize_factor=1,
-    add_feat_axis=True
+        vol_names,
+        augment,
+        batch_size=1,
+        segs=None,
+        np_var='vol',
+        pad_shape=None,
+        resize_factor=1,
+        add_feat_axis=True,
+        ret_affine=True
 ):
     """
     Base generator for random volume loading. Volumes can be passed as a path to
@@ -51,8 +487,9 @@ def volgen(
 
         # load volumes and concatenate
         load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis,
-                           pad_shape=pad_shape, resize_factor=resize_factor)
-        imgs = [py.utils.load_volfile(vol_names[i], augment, **load_params) for i in indices]
+                           pad_shape=pad_shape, resize_factor=resize_factor, ret_affine=ret_affine)
+        imgs = [py.utils.load_inter_volfile(vol_names[i], augment, **load_params) for i in indices]
+        img_names = [vol_names[i] for i in indices]
         vols = [np.concatenate(imgs, axis=0)]
 
         # optionally load segmentations and concatenate
@@ -66,113 +503,10 @@ def volgen(
             s = [py.utils.load_volfile(segs[i], augment, **load_params) for i in indices]
             vols.append(np.concatenate(s, axis=0))
 
-        yield tuple(vols)
+        yield [tuple(vols), img_names]
 
 
-def vol_pair_gen(
-    vol_names,
-    augment,
-    batch_size=1,
-    segs=None,
-    np_var='vol',
-    pad_shape=None,
-    resize_factor=1,
-    add_feat_axis=True
-):
-    """
-    Base generator for random intra-subject volume pair loading. Volumes can be passed as a path to
-    the parent directory, a glob pattern, a list of file paths, or a list of
-    preloaded volumes. Corresponding segmentations are additionally loaded if
-    `segs` is provided as a list (of file paths or preloaded segmentations) or set
-    to True. If `segs` is True, npz files with variable names 'vol' and 'seg' are
-    expected. Passing in preloaded volumes (with optional preloaded segmentations)
-    allows volumes preloaded in memory to be passed to a generator.
-
-    Parameters:
-        vol_names: Path, glob pattern, list of volume files to load, or list of
-            preloaded volumes.
-        batch_size: Batch size. Default is 1.
-        segs: Loads corresponding segmentations. Default is None.
-        np_var: Name of the volume variable if loading npz files. Default is 'vol'.
-        pad_shape: Zero-pads loaded volumes to a given shape. Default is None.
-        resize_factor: Volume resize factor. Default is 1.
-        add_feat_axis: Load volume arrays with added feature axis. Default is True.
-    """
-
-    # convert glob path to filenames
-    if isinstance(vol_names, str):
-        if os.path.isdir(vol_names):
-            vol_names = os.path.join(vol_names, '*')
-        vol_names = glob.glob(vol_names)
-
-    if isinstance(segs, list) and len(segs) != len(vol_names):
-        raise ValueError('Number of image files must match number of seg files.')
-
-    while True:
-        # generate [batchsize] random image indices
-        indices = np.random.randint(len(vol_names), size=batch_size)
-
-        # load volumes and concatenate
-        load_params = dict(np_var=np_var, add_batch_axis=True, add_feat_axis=add_feat_axis,
-                           pad_shape=pad_shape, resize_factor=resize_factor)
-        imgs = [py.utils.load_bl_fu_file(vol_names[i], augment,  **load_params) for i in indices]
-        vols = [np.concatenate(imgs, axis=0)]
-
-        # optionally load segmentations and concatenate
-        if segs is True:
-            # assume inputs are npz files with 'seg' key
-            load_params['np_var'] = 'seg'  # be sure to load seg
-            s = [py.utils.load_volfile(vol_names[i], **load_params) for i in indices]
-            vols.append(np.concatenate(s, axis=0))
-        elif isinstance(segs, list):
-            # assume segs is a corresponding list of files or preloaded volumes
-            s = [py.utils.load_volfile(segs[i], **load_params) for i in indices]
-            vols.append(np.concatenate(s, axis=0))
-
-        yield tuple(vols)
-
-
-def intra_scan_pair(vol_names, augment, bidir=False, batch_size=1, prob_same=0, no_warp=False, **kwargs):
-    """
-    Generator for scan-to-scan registration.
-
-    Parameters:
-        vol_names: List of volume files to load, or list of preloaded volumes.
-        bidir: Yield input image as output for bidirectional models. Default is False.
-        batch_size: Batch size. Default is 1.
-        prob_same: Induced probability that source and target inputs are the same. Default is 0.
-        no_warp: Excludes null warp in output list if set to True (for affine training).
-            Default if False.
-        kwargs: Forwarded to the internal volgen generator.
-    """
-    zeros = None
-    gen = vol_pair_gen(vol_names, augment, batch_size=batch_size, **kwargs)
-    while True:
-        scans = next(gen)[0]
-        scan1 = scans[::2].squeeze(1)
-        scan2 = scans[1::2].squeeze(1)
-
-        # some induced chance of making source and target equal
-        if prob_same > 0 and np.random.rand() < prob_same:
-            if np.random.rand() > 0.5:
-                scan1 = scan2
-            else:
-                scan2 = scan1
-
-        # cache zeros
-        if not no_warp and zeros is None:
-            shape = scan1.shape[1:-1]
-            zeros = np.zeros((batch_size, *shape, len(shape)))
-
-        invols = [scan1, scan2]
-        outvols = [scan2, scan1] if bidir else [scan2]
-        if not no_warp:
-            outvols.append(zeros)
-
-        yield (invols, outvols)
-
-
-def scan_to_scan(vol_names, augment, bidir=False, batch_size=1, prob_same=0, no_warp=False, **kwargs):
+def inter_scan_pair(vol_names, augment, bidir=False, batch_size=1, prob_same=0, no_warp=False, **kwargs):
     """
     Generator for scan-to-scan registration.
 
@@ -182,14 +516,18 @@ def scan_to_scan(vol_names, augment, bidir=False, batch_size=1, prob_same=0, no_
         batch_size: Batch size. Default is 1.
         prob_same: Induced probability that source and target inputs are the same. Default is 0.
         no_warp: Excludes null warp in output list if set to True (for affine training). 
-            Default if False.
+            Default is False.
         kwargs: Forwarded to the internal volgen generator.
     """
     zeros = None
     gen = volgen(vol_names, augment, batch_size=batch_size, **kwargs)
     while True:
-        scan1 = next(gen)[0]
-        scan2 = next(gen)[0]
+        # scan1 = next(gen)[0]
+        # scan2 = next(gen)[0]
+        scan1, img_names1 = next(gen)
+        scan1 = scan1[0]
+        scan2, img_names2 = next(gen)
+        scan2 = scan2[0]
 
         # some induced chance of making source and target equal
         if prob_same > 0 and np.random.rand() < prob_same:
@@ -358,19 +696,19 @@ def conditional_template_creation(vol_names, atlas, attributes,
 
 
 def surf_semisupervised(
-    vol_names,
-    atlas_vol,
-    atlas_seg,
-    nb_surface_pts,
-    labels=None,
-    batch_size=1,
-    surf_bidir=True,
-    surface_pts_upsample_factor=2,
-    smooth_seg_std=1,
-    nb_labels_sample=None,
-    sdt_vol_resize=1,
-    align_segs=False,
-    add_feat_axis=True
+        vol_names,
+        atlas_vol,
+        atlas_seg,
+        nb_surface_pts,
+        labels=None,
+        batch_size=1,
+        surf_bidir=True,
+        surface_pts_upsample_factor=2,
+        smooth_seg_std=1,
+        nb_labels_sample=None,
+        sdt_vol_resize=1,
+        align_segs=False,
+        add_feat_axis=True
 ):
     """
     Scan-to-atlas generator for semi-supervised learning using surface point clouds 

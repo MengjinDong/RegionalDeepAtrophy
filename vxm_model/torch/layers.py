@@ -12,6 +12,7 @@ class SpatialTransformer(nn.Module):
         super().__init__()
 
         self.mode = mode
+        self.size = size
 
         # create sampling grid
         vectors = [torch.arange(0, s) for s in size]
@@ -45,7 +46,7 @@ class SpatialTransformer(nn.Module):
             new_locs = new_locs.permute(0, 2, 3, 4, 1)
             new_locs = new_locs[..., [2, 1, 0]]
 
-        return nnf.grid_sample(src, new_locs, mode=self.mode)
+        return nnf.grid_sample(src, new_locs, mode=self.mode, padding_mode="border")
 
 
 class VecInt(nn.Module):
@@ -57,6 +58,7 @@ class VecInt(nn.Module):
         super().__init__()
 
         assert nsteps >= 0, 'nsteps should be >= 0, found: %d' % nsteps
+        self.inshape = inshape
         self.nsteps = nsteps
         self.scale = 1.0 / (2 ** self.nsteps)
         self.transformer = SpatialTransformer(inshape)

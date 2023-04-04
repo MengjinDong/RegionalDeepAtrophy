@@ -22,16 +22,3 @@ if backend == 'pytorch':
     from .torch import layers
     from .torch import networks
     from .torch import losses
-
-else:
-    # tensorflow is default backend
-    try:
-        import tensorflow
-    except ImportError:
-        raise ImportError('Please install tensorflow to use this voxelmorph backend')
-
-    from . import tf
-    from .tf import layers
-    from .tf import networks
-    from .tf import losses
-    from .tf import utils
