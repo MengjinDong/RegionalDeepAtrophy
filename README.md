@@ -32,26 +32,29 @@ To test the quality of a model by computing dice overlap between an atlas segmen
 Optimal parameters are set as the default value in the training process.
 
 
-### CVPR version
-
 For the CC loss function, we found a reg parameter of 1 to work best. For the MSE loss function, we found 0.01 to work best.
 
 
-### MICCAI version
-
 For our data, we found `image_sigma=0.01` and `prior_lambda=25` to work best.
-
-In the original MICCAI code, the parameters were applied after the scaling of the velocity field. With the newest code, this has been "fixed", with different default parameters reflecting the change. We recommend running the updated code. However, if you'd like to run the very original MICCAI2018 mode, please use `xy` indexing and `use_miccai_int` network option, with MICCAI2018 parameters.
 
 
 ## Spatial Transforms and Integration
 
 - The spatial transform code, found at `voxelmorph.layers.SpatialTransformer`, accepts N-dimensional affine and dense transforms, including linear and nearest neighbor interpolation options. Note that original development of VoxelMorph used `xy` indexing, whereas we are now emphasizing `ij` indexing.
 
-- For the MICCAI2018 version, we integrate the velocity field using `voxelmorph.layers.VecInt`. By default we integrate using scaling and squaring, which we found efficient.
 
 
-# VoxelMorph Papers
+# Regional Deep Atrophy Papers
+
+   **Regional Deep Atrophy: a Self-Supervised Learning Method to Automatically Identify Regions Associated With Alzheimer's Disease Progression From Longitudinal MRI**
+   Mengjin Dong, Long Xie, Sandhitsu R. Das, Jiancong Wang, Laura E.M. Wisse, Robin deFlores, David A. Wolk, Paul A. Yushkevich (for the Alzheimer's Disease Neuroimaging Initiative)
+   https://arxiv.org/abs/2304.04673
+   
+   **DeepAtrophy: Teaching a neural network to detect progressive changes in longitudinal MRI of the hippocampal region in Alzheimer's disease**
+   Mengjin Dong, Long Xie, Sandhitsu R. Das, Jiancong Wang, Laura E.M. Wisse, Robin deFlores, David A. Wolk, Paul A. Yushkevich (for the Alzheimer's Disease Neuroimaging Initiative)
+   NeuroImage 2021: https://www.sciencedirect.com/science/article/pii/S1053811921007874
+
+
 
 Only the most basic part of voxelmorph was used in RDA:
 
